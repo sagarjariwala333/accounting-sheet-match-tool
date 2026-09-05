@@ -2,14 +2,15 @@ import { NextResponse } from "next/server";
 
 export interface MatchedRecord {
   id: string;
-  sheet1Client: string;
-  sheet1Balance: string | number;
   sheet2Code: string;
   sheet2Name: string;
-  sheet2Status: string;
+  sheet1Client: string;
+  sheet1Balance: string | number;
   sheet2DueAmount: string | number;
-  matchType: "Code Match" | "Name Substring Match" | "Token Match";
+  sheet2Status: string;
+  matchType: "Code Match" | "Name Substring Match" | "Token Match" | "Sheet 2 Only (Unmatched)";
   confidence: number;
+  isMatched: boolean;
 }
 
 export function normalizeString(str: string): string {
@@ -30,7 +31,6 @@ export function extractCode(str: string): string {
 export function cleanNameFromClientString(clientStr: string): string {
   if (!clientStr) return "";
   let name = clientStr.trim();
-  // Remove trailing code like -SS92239 or - SS46007 or (SS12345) and tags like OLD/NEW
   name = name.replace(/\b(OLD|NEW)\b/gi, "").trim();
   name = name.replace(/[-_\s:(]+\b[A-Z]{1,4}\d{3,10}\b[)]*/gi, "").trim();
   name = name.replace(/[-_\s]+$/, "").trim();
@@ -136,7 +136,6 @@ export async function POST(request: Request) {
         }
       });
       if (s2NameIdx === -1 || s2NameIdx === s2CodeIdx) {
-        // Fallback: if Sheet 2 has no separate name column, use column 1 or 0
         s2NameIdx = s2CodeIdx === 0 && maxCols2 > 1 ? 1 : 0;
       }
     }
@@ -151,35 +150,43 @@ export async function POST(request: Request) {
       });
     }
 
-    const matchedRecords: MatchedRecord[] = [];
+    const resultantRecords: MatchedRecord[] = [];
     const matchedS1Indices = new Set<number>();
-    const matchedS2Indices = new Set<number>();
+    let matchedCount = 0;
+    let unmatchedCount = 0;
 
-    // --- Perform Matching ---
-    sheet1Rows.forEach((row1: any[], idx1: number) => {
-      const s1RawClient = row1[s1ClientIdx] !== undefined ? String(row1[s1ClientIdx]).trim() : "";
-      const s1Balance = row1[s1BalanceIdx] !== undefined ? row1[s1BalanceIdx] : "";
-      if (!s1RawClient) return;
+    // --- Iterate Over EVERY Customer Row in Sheet 2 (Guarantees ALL Sheet 2 customers in output) ---
+    sheet2Rows.forEach((row2: any[], idx2: number) => {
+      const s2RawCode = row2[s2CodeIdx] !== undefined ? String(row2[s2CodeIdx]).trim() : "";
+      let s2RawName = row2[s2NameIdx] !== undefined ? String(row2[s2NameIdx]).trim() : "";
+      let s2RawStatus = s2StatusIdx !== -1 && row2[s2StatusIdx] !== undefined ? String(row2[s2StatusIdx]).trim() : "active";
+      const s2DueAmount = row2[s2DueIdx] !== undefined ? row2[s2DueIdx] : 0;
 
-      const s1Code = extractCode(s1RawClient);
-      const s1Norm = normalizeString(s1RawClient);
+      if (!isNaN(Number(s2RawStatus)) || s2RawStatus === String(s2DueAmount)) {
+        s2RawStatus = "active";
+      }
 
-      let bestMatchIdx2 = -1;
+      if (!s2RawCode && !s2RawName) return; // Skip empty spacing rows
+
+      const s2Code = extractCode(s2RawCode) || s2RawCode.toUpperCase();
+      const s2NormName = normalizeString(s2RawName);
+
+      let bestMatchIdx1 = -1;
       let bestMatchType: "Code Match" | "Name Substring Match" | "Token Match" = "Code Match";
       let bestScore = 0;
 
-      sheet2Rows.forEach((row2: any[], idx2: number) => {
-        const s2RawCode = row2[s2CodeIdx] !== undefined ? String(row2[s2CodeIdx]).trim() : "";
-        const s2RawName = row2[s2NameIdx] !== undefined ? String(row2[s2NameIdx]).trim() : "";
-        const s2Code = extractCode(s2RawCode) || s2RawCode.toUpperCase();
-        const s2NormName = normalizeString(s2RawName);
+      // Find match in Sheet 1
+      sheet1Rows.forEach((row1: any[], idx1: number) => {
+        const s1RawClient = row1[s1ClientIdx] !== undefined ? String(row1[s1ClientIdx]).trim() : "";
+        if (!s1RawClient) return;
 
-        if (!s2RawName && !s2RawCode) return;
+        const s1Code = extractCode(s1RawClient);
+        const s1Norm = normalizeString(s1RawClient);
 
-        // Rule A: Exact Code Match
+        // Rule A: Code match
         if (s1Code && s2Code && s1Code === s2Code) {
           bestScore = 100;
-          bestMatchIdx2 = idx2;
+          bestMatchIdx1 = idx1;
           bestMatchType = "Code Match";
           return;
         }
@@ -189,14 +196,14 @@ export async function POST(request: Request) {
           const score = 90 + Math.min(10, s2NormName.length);
           if (score > bestScore) {
             bestScore = score;
-            bestMatchIdx2 = idx2;
+            bestMatchIdx1 = idx1;
             bestMatchType = "Name Substring Match";
           }
         } else if (s1Norm && s1Norm.length >= 3 && s2NormName.includes(s1Norm)) {
           const score = 85;
           if (score > bestScore) {
             bestScore = score;
-            bestMatchIdx2 = idx2;
+            bestMatchIdx1 = idx1;
             bestMatchType = "Name Substring Match";
           }
         }
@@ -211,43 +218,53 @@ export async function POST(request: Request) {
             const score = 75 + (commonTokens.length / s2Tokens.length) * 10;
             if (score > bestScore) {
               bestScore = score;
-              bestMatchIdx2 = idx2;
+              bestMatchIdx1 = idx1;
               bestMatchType = "Token Match";
             }
           }
         }
       });
 
-      if (bestMatchIdx2 !== -1 && bestScore >= 70) {
-        const row2 = sheet2Rows[bestMatchIdx2];
-        matchedS1Indices.add(idx1);
-        matchedS2Indices.add(bestMatchIdx2);
+      if (bestMatchIdx1 !== -1 && bestScore >= 70) {
+        // MATCHED WITH SHEET 1
+        const row1 = sheet1Rows[bestMatchIdx1];
+        matchedS1Indices.add(bestMatchIdx1);
+        matchedCount++;
 
-        let rawStatus = s2StatusIdx !== -1 && row2[s2StatusIdx] !== undefined ? String(row2[s2StatusIdx]).trim() : "active";
-        if (!isNaN(Number(rawStatus)) || rawStatus === String(row2[s2DueIdx])) {
-          rawStatus = "active";
+        const s1RawClient = String(row1[s1ClientIdx] || "").trim();
+        const s1Balance = row1[s1BalanceIdx] !== undefined ? row1[s1BalanceIdx] : 0;
+
+        // If customer name in Sheet 2 is missing or equals code, extract clean customer name from Sheet 1 client string
+        if (!s2RawName || s2RawName === s2RawCode || s2RawName.match(/^[A-Z]{1,4}\d{3,10}$/i)) {
+          s2RawName = cleanNameFromClientString(s1RawClient);
         }
 
-        let rawCode = row2[s2CodeIdx] !== undefined ? String(row2[s2CodeIdx]).trim() : "";
-        if (!rawCode) rawCode = s1Code;
-
-        let custName = row2[s2NameIdx] !== undefined ? String(row2[s2NameIdx]).trim() : "";
-        
-        // If customer name is empty, identical to code, or is a code pattern (like SS92239), extract clean name from Sheet 1!
-        if (!custName || custName === rawCode || custName.match(/^[A-Z]{1,4}\d{3,10}$/i)) {
-          custName = cleanNameFromClientString(s1RawClient);
-        }
-
-        matchedRecords.push({
-          id: `match-${idx1}-${bestMatchIdx2}`,
+        resultantRecords.push({
+          id: `result-${idx2}`,
+          sheet2Code: s2RawCode || s2Code,
+          sheet2Name: s2RawName,
           sheet1Client: s1RawClient,
           sheet1Balance: s1Balance,
-          sheet2Code: rawCode,
-          sheet2Name: custName,
-          sheet2Status: rawStatus,
-          sheet2DueAmount: row2[s2DueIdx] !== undefined ? row2[s2DueIdx] : 0,
+          sheet2DueAmount: s2DueAmount,
+          sheet2Status: s2RawStatus,
           matchType: bestMatchType,
           confidence: Math.min(100, Math.round(bestScore)),
+          isMatched: true,
+        });
+      } else {
+        // UNMATCHED IN SHEET 1 (Included in resultant sheet as Sheet 2 customer)
+        unmatchedCount++;
+        resultantRecords.push({
+          id: `result-${idx2}`,
+          sheet2Code: s2RawCode || s2Code,
+          sheet2Name: s2RawName || s2RawCode,
+          sheet1Client: "Not Found in Sheet 1",
+          sheet1Balance: 0,
+          sheet2DueAmount: s2DueAmount,
+          sheet2Status: s2RawStatus,
+          matchType: "Sheet 2 Only (Unmatched)",
+          confidence: 0,
+          isMatched: false,
         });
       }
     });
@@ -260,33 +277,23 @@ export async function POST(request: Request) {
         rawRow: row,
       }));
 
-    const unmatchedSheet2 = sheet2Rows
-      .filter((_: any, idx: number) => !matchedS2Indices.has(idx))
-      .map((row: any[]) => ({
-        code: row[s2CodeIdx] !== undefined ? String(row[s2CodeIdx]) : "",
-        name: row[s2NameIdx] !== undefined ? String(row[s2NameIdx]) : "",
-        status: s2StatusIdx !== -1 && row[s2StatusIdx] !== undefined ? String(row[s2StatusIdx]) : "active",
-        dueAmount: row[s2DueIdx] !== undefined ? row[s2DueIdx] : "",
-        rawRow: row,
-      }));
-
     return NextResponse.json({
       success: true,
       stats: {
         totalSheet1Rows: sheet1Rows.length,
         totalSheet2Rows: sheet2Rows.length,
-        matchedCount: matchedRecords.length,
+        resultantTotalRows: resultantRecords.length,
+        matchedCount,
+        unmatchedSheet2Count: unmatchedCount,
         unmatchedSheet1Count: unmatchedSheet1.length,
-        unmatchedSheet2Count: unmatchedSheet2.length,
-        matchRate: Math.round((matchedRecords.length / (sheet1Rows.length || 1)) * 100),
+        matchRate: Math.round((matchedCount / (sheet2Rows.length || 1)) * 100),
       },
-      matchedRecords,
+      resultantRecords,
       unmatchedSheet1,
-      unmatchedSheet2,
     });
   } catch (error: any) {
     return NextResponse.json(
-      { success: false, error: error?.message || "Failed to perform sheet matching" },
+      { success: false, error: error?.message || "Failed to generate resultant sheet" },
       { status: 500 }
     );
   }

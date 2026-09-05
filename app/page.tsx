@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef } from "react";
 import {
   Upload,
   FileSpreadsheet,
@@ -9,12 +9,12 @@ import {
   RefreshCw,
   Layers,
   FileText,
-  ArrowRightLeft,
   Trash2,
   Download,
   Link2,
   Sparkles,
   Search,
+  Filter,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -39,30 +39,31 @@ interface UploadedFileState {
   activeSheet: string;
 }
 
-interface MatchedRecord {
+interface ResultantRecord {
   id: string;
-  sheet1Client: string;
-  sheet1Balance: string | number;
   sheet2Code: string;
   sheet2Name: string;
-  sheet2Status: string;
+  sheet1Client: string;
+  sheet1Balance: string | number;
   sheet2DueAmount: string | number;
-  matchType: "Code Match" | "Name Substring Match" | "Token Match";
+  sheet2Status: string;
+  matchType: "Code Match" | "Name Substring Match" | "Token Match" | "Sheet 2 Only (Unmatched)";
   confidence: number;
+  isMatched: boolean;
 }
 
 interface MatchResultState {
   stats: {
     totalSheet1Rows: number;
     totalSheet2Rows: number;
+    resultantTotalRows: number;
     matchedCount: number;
-    unmatchedSheet1Count: number;
     unmatchedSheet2Count: number;
+    unmatchedSheet1Count: number;
     matchRate: number;
   };
-  matchedRecords: MatchedRecord[];
+  resultantRecords: ResultantRecord[];
   unmatchedSheet1: Array<{ client: string; balance: any }>;
-  unmatchedSheet2: Array<{ code: string; name: string; status: string; dueAmount: any }>;
 }
 
 export default function HomePage() {
@@ -76,7 +77,8 @@ export default function HomePage() {
   const [matchResults, setMatchResults] = useState<MatchResultState | null>(null);
   const [matchLoading, setMatchLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
-  const [selectedView, setSelectedView] = useState<"combined" | "file1" | "file2" | "unmatched">("combined");
+  const [selectedView, setSelectedView] = useState<"resultant" | "file1" | "file2">("resultant");
+  const [resultFilter, setResultFilter] = useState<"all" | "matched" | "unmatched">("all");
 
   const input1Ref = useRef<HTMLInputElement>(null);
   const input2Ref = useRef<HTMLInputElement>(null);
@@ -115,7 +117,6 @@ export default function HomePage() {
 
       setFileState(newState);
 
-      // If both files are now uploaded, perform sheet matching!
       const currentFile1 = slot === 1 ? newState : file1;
       const currentFile2 = slot === 2 ? newState : file2;
 
@@ -153,7 +154,7 @@ export default function HomePage() {
       const data = await res.json();
       if (data.success) {
         setMatchResults(data);
-        setSelectedView("combined");
+        setSelectedView("resultant");
       }
     } catch (err) {
       console.error("Matching error:", err);
@@ -190,24 +191,31 @@ export default function HomePage() {
     }
   };
 
-  const exportCombinedExcel = () => {
-    if (!matchResults || matchResults.matchedRecords.length === 0) return;
+  const exportResultantExcel = () => {
+    if (!matchResults || matchResults.resultantRecords.length === 0) return;
 
-    const exportData = matchResults.matchedRecords.map((m) => ({
-      "Customer Code": m.sheet2Code,
+    let recordsToExport = matchResults.resultantRecords;
+    if (resultFilter === "matched") {
+      recordsToExport = recordsToExport.filter((r) => r.isMatched);
+    } else if (resultFilter === "unmatched") {
+      recordsToExport = recordsToExport.filter((r) => !r.isMatched);
+    }
+
+    const exportData = recordsToExport.map((m) => ({
+      "Customer Code (Sheet 2)": m.sheet2Code,
       "Customer Name (Sheet 2)": m.sheet2Name,
       "Client String (Sheet 1)": m.sheet1Client,
       "Balance (Sheet 1)": m.sheet1Balance,
       "Due Amount (Sheet 2)": m.sheet2DueAmount,
       "Status": m.sheet2Status,
-      "Match Method": m.matchType,
+      "Match Status": m.isMatched ? `Matched (${m.matchType})` : "Unmatched (Sheet 2 Only)",
       "Match Confidence": `${m.confidence}%`,
     }));
 
     const worksheet = XLSX.utils.json_to_sheet(exportData);
     const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, "Combined Matched Clients");
-    XLSX.writeFile(workbook, `Matched_Combined_Clients.xlsx`);
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Resultant All Customers");
+    XLSX.writeFile(workbook, `Resultant_All_Sheet2_Customers.xlsx`);
   };
 
   const exportExcel = (fileState: UploadedFileState) => {
@@ -228,7 +236,6 @@ export default function HomePage() {
     XLSX.writeFile(workbook, `Export_${fileState.fileName}`);
   };
 
-  // Helper to render sheet data table
   const renderSheetTable = (fileState: UploadedFileState) => {
     const meta = fileState.sheetsMeta[fileState.activeSheet];
     if (!meta) return null;
@@ -325,13 +332,18 @@ export default function HomePage() {
     );
   };
 
-  const filteredMatches = matchResults
-    ? matchResults.matchedRecords.filter(
-        (m) =>
+  const filteredResultant = matchResults
+    ? matchResults.resultantRecords.filter((m) => {
+        const matchesQuery =
           m.sheet2Name.toLowerCase().includes(searchQuery.toLowerCase()) ||
           m.sheet1Client.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          m.sheet2Code.toLowerCase().includes(searchQuery.toLowerCase())
-      )
+          m.sheet2Code.toLowerCase().includes(searchQuery.toLowerCase());
+
+        if (!matchesQuery) return false;
+        if (resultFilter === "matched") return m.isMatched;
+        if (resultFilter === "unmatched") return !m.isMatched;
+        return true;
+      })
     : [];
 
   return (
@@ -339,13 +351,13 @@ export default function HomePage() {
       {/* Title Header */}
       <div className="text-center max-w-2xl mx-auto space-y-2">
         <Badge variant="outline" className="text-emerald-400 border-emerald-500/30 bg-emerald-500/10 mb-2">
-          <Link2 className="h-3.5 w-3.5 mr-1" /> Excel Sheet Matcher & Combiner
+          <Link2 className="h-3.5 w-3.5 mr-1" /> Excel Sheet Combiner (Sheet 2 Centric)
         </Badge>
         <h2 className="text-3xl font-extrabold text-white tracking-tight sm:text-4xl">
-          Upload & Match Two Excel Sheets (.xlsx)
+          Resultant Sheet with ALL Sheet 2 Customers
         </h2>
         <p className="text-sm text-slate-400">
-          Upload Sheet 1 (Client & Balance) and Sheet 2 (Code, Name, Status, Due). The system matches Sheet 2 customer names against Sheet 1 client names and combines them.
+          Generates a complete resultant dataset containing <strong>all customers from Sheet 2</strong>, combined with matched data from Sheet 1.
         </p>
       </div>
 
@@ -455,7 +467,7 @@ export default function HomePage() {
           <div className="flex items-center justify-between mb-4">
             <span className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
               <span className="flex h-5 w-5 items-center justify-center rounded-full bg-blue-500/20 text-blue-400 font-mono text-[11px]">2</span>
-              Sheet 2 (Code, Name, Status, Due)
+              Sheet 2 (All Customers Target)
             </span>
             {file2 && (
               <Badge variant="default" className="gap-1 bg-blue-500/10 text-blue-400 border-blue-500/20">
@@ -537,15 +549,15 @@ export default function HomePage() {
             <div className="flex items-center gap-2 overflow-x-auto">
               {matchResults && (
                 <button
-                  onClick={() => setSelectedView("combined")}
+                  onClick={() => setSelectedView("resultant")}
                   className={`flex items-center gap-2 rounded-lg px-4 py-2 text-xs font-semibold transition-all ${
-                    selectedView === "combined"
+                    selectedView === "resultant"
                       ? "bg-gradient-to-r from-emerald-600 to-teal-500 text-white shadow-lg shadow-emerald-500/20"
                       : "text-slate-400 hover:bg-slate-900 hover:text-white"
                   }`}
                 >
                   <Sparkles className="h-4 w-4 text-emerald-300" />
-                  Combined Matched Sheet ({matchResults.stats.matchedCount})
+                  Resultant Sheet (All {matchResults.stats.resultantTotalRows} Sheet 2 Customers)
                 </button>
               )}
 
@@ -559,7 +571,7 @@ export default function HomePage() {
                   }`}
                 >
                   <FileText className="h-4 w-4" />
-                  Sheet 1 ({file1.fileName})
+                  Raw Sheet 1 ({file1.fileName})
                 </button>
               )}
 
@@ -573,86 +585,107 @@ export default function HomePage() {
                   }`}
                 >
                   <FileText className="h-4 w-4" />
-                  Sheet 2 ({file2.fileName})
-                </button>
-              )}
-
-              {matchResults && (matchResults.unmatchedSheet1.length > 0 || matchResults.unmatchedSheet2.length > 0) && (
-                <button
-                  onClick={() => setSelectedView("unmatched")}
-                  className={`flex items-center gap-2 rounded-lg px-4 py-2 text-xs font-semibold transition-all ${
-                    selectedView === "unmatched"
-                      ? "bg-rose-500/20 text-rose-400 border border-rose-500/30"
-                      : "text-slate-400 hover:bg-slate-900 hover:text-white"
-                  }`}
-                >
-                  <AlertCircle className="h-4 w-4 text-rose-400" />
-                  Unmatched Items
+                  Raw Sheet 2 ({file2.fileName})
                 </button>
               )}
             </div>
 
-            {matchResults && selectedView === "combined" && (
+            {matchResults && selectedView === "resultant" && (
               <Button
                 variant="gradientSuccess"
                 size="sm"
-                onClick={exportCombinedExcel}
+                onClick={exportResultantExcel}
                 className="gap-2 text-xs"
               >
-                <Download className="h-4 w-4" /> Download Combined Excel (.xlsx)
+                <Download className="h-4 w-4" /> Download Resultant Excel (.xlsx)
               </Button>
             )}
           </div>
 
-          {/* VIEW: Combined Matched View */}
-          {selectedView === "combined" && matchResults && (
+          {/* VIEW: Resultant Combined Sheet */}
+          {selectedView === "resultant" && matchResults && (
             <div className="space-y-6">
               {/* Match Stats KPI Banner */}
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                <Card className="p-4 bg-slate-900/90 border-blue-500/30">
+                  <p className="text-[11px] font-semibold uppercase text-blue-400">Resultant Total (Sheet 2)</p>
+                  <p className="text-2xl font-bold text-white mt-1 font-mono">
+                    {matchResults.stats.resultantTotalRows} Customers
+                  </p>
+                </Card>
+
                 <Card className="p-4 bg-slate-900/90 border-emerald-500/30">
                   <p className="text-[11px] font-semibold uppercase text-emerald-400 flex items-center gap-1">
-                    <CheckCircle2 className="h-3.5 w-3.5" /> Matched Records
+                    <CheckCircle2 className="h-3.5 w-3.5" /> Matched with Sheet 1
                   </p>
                   <p className="text-2xl font-bold text-emerald-400 mt-1 font-mono">
                     {matchResults.stats.matchedCount}
                   </p>
                 </Card>
 
-                <Card className="p-4 bg-slate-900/90 border-blue-500/30">
-                  <p className="text-[11px] font-semibold uppercase text-blue-400">Match Success Rate</p>
-                  <p className="text-2xl font-bold text-white mt-1 font-mono">
-                    {matchResults.stats.matchRate}%
-                  </p>
-                </Card>
-
-                <Card className="p-4 bg-slate-900/90 border-rose-500/30">
-                  <p className="text-[11px] font-semibold uppercase text-rose-400">Unmatched Sheet 1</p>
-                  <p className="text-2xl font-bold text-rose-400 mt-1 font-mono">
-                    {matchResults.stats.unmatchedSheet1Count}
+                <Card className="p-4 bg-slate-900/90 border-amber-500/30">
+                  <p className="text-[11px] font-semibold uppercase text-amber-400">Sheet 2 Only (Unmatched)</p>
+                  <p className="text-2xl font-bold text-amber-400 mt-1 font-mono">
+                    {matchResults.stats.unmatchedSheet2Count}
                   </p>
                 </Card>
 
                 <Card className="p-4 bg-slate-900/90 border-purple-500/30">
-                  <p className="text-[11px] font-semibold uppercase text-purple-400">Unmatched Sheet 2</p>
+                  <p className="text-[11px] font-semibold uppercase text-purple-400">Match Coverage Rate</p>
                   <p className="text-2xl font-bold text-purple-300 mt-1 font-mono">
-                    {matchResults.stats.unmatchedSheet2Count}
+                    {matchResults.stats.matchRate}%
                   </p>
                 </Card>
               </div>
 
-              {/* Search Bar */}
-              <div className="relative">
-                <Search className="absolute left-3 top-3 h-4 w-4 text-slate-500" />
-                <input
-                  type="text"
-                  placeholder="Filter matched records by client name or code..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full h-10 rounded-xl border border-slate-800 bg-slate-900/90 pl-9 pr-4 text-xs text-slate-200 placeholder-slate-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-                />
+              {/* Filters & Search */}
+              <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
+                <div className="relative flex-1 w-full">
+                  <Search className="absolute left-3 top-3 h-4 w-4 text-slate-500" />
+                  <input
+                    type="text"
+                    placeholder="Search resultant sheet by customer code, name, or client string..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="w-full h-10 rounded-xl border border-slate-800 bg-slate-900/90 pl-9 pr-4 text-xs text-slate-200 placeholder-slate-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  />
+                </div>
+
+                <div className="flex items-center gap-1.5 bg-slate-900 p-1 rounded-xl border border-slate-800 shrink-0">
+                  <button
+                    onClick={() => setResultFilter("all")}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                      resultFilter === "all"
+                        ? "bg-slate-800 text-white border border-slate-700"
+                        : "text-slate-400 hover:text-white"
+                    }`}
+                  >
+                    All Customers ({matchResults.stats.resultantTotalRows})
+                  </button>
+                  <button
+                    onClick={() => setResultFilter("matched")}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                      resultFilter === "matched"
+                        ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
+                        : "text-slate-400 hover:text-white"
+                    }`}
+                  >
+                    Matched ({matchResults.stats.matchedCount})
+                  </button>
+                  <button
+                    onClick={() => setResultFilter("unmatched")}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                      resultFilter === "unmatched"
+                        ? "bg-amber-500/20 text-amber-400 border border-amber-500/30"
+                        : "text-slate-400 hover:text-white"
+                    }`}
+                  >
+                    Unmatched ({matchResults.stats.unmatchedSheet2Count})
+                  </button>
+                </div>
               </div>
 
-              {/* Combined Table */}
+              {/* Resultant Combined Table */}
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -663,19 +696,19 @@ export default function HomePage() {
                     <TableHead className="font-bold text-emerald-400 text-right">Balance (Sheet 1)</TableHead>
                     <TableHead className="font-bold text-blue-400 text-right">Due Amount (Sheet 2)</TableHead>
                     <TableHead className="font-bold text-purple-400">Status</TableHead>
-                    <TableHead className="font-bold text-indigo-400">Match Method</TableHead>
+                    <TableHead className="font-bold text-indigo-400">Match Status</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {filteredMatches.length === 0 ? (
+                  {filteredResultant.length === 0 ? (
                     <TableRow>
                       <TableCell colSpan={8} className="text-center py-8 text-xs text-slate-400">
-                        No matched records found.
+                        No records match the current search or filter.
                       </TableCell>
                     </TableRow>
                   ) : (
-                    filteredMatches.slice(0, 100).map((row, idx) => (
-                      <TableRow key={row.id}>
+                    filteredResultant.slice(0, 150).map((row, idx) => (
+                      <TableRow key={row.id} className={!row.isMatched ? "bg-amber-950/10" : ""}>
                         <TableCell className="text-center font-mono text-xs text-slate-500">
                           {idx + 1}
                         </TableCell>
@@ -686,10 +719,14 @@ export default function HomePage() {
                           {row.sheet2Name}
                         </TableCell>
                         <TableCell className="font-mono text-xs text-slate-300">
-                          {row.sheet1Client}
+                          {row.isMatched ? (
+                            row.sheet1Client
+                          ) : (
+                            <span className="text-amber-400/70 italic">Not Found in Sheet 1</span>
+                          )}
                         </TableCell>
                         <TableCell className="font-mono text-xs text-right font-bold text-emerald-400">
-                          {String(row.sheet1Balance)}
+                          {row.isMatched ? String(row.sheet1Balance) : "-"}
                         </TableCell>
                         <TableCell className="font-mono text-xs text-right font-bold text-blue-400">
                           {String(row.sheet2DueAmount)}
@@ -700,18 +737,27 @@ export default function HomePage() {
                           </Badge>
                         </TableCell>
                         <TableCell>
-                          <Badge
-                            variant={row.matchType === "Code Match" ? "success" : "default"}
-                            className="text-[10px]"
-                          >
-                            {row.matchType} ({row.confidence}%)
-                          </Badge>
+                          {row.isMatched ? (
+                            <Badge variant="success" className="text-[10px]">
+                              {row.matchType} ({row.confidence}%)
+                            </Badge>
+                          ) : (
+                            <Badge variant="warning" className="text-[10px]">
+                              Sheet 2 Only
+                            </Badge>
+                          )}
                         </TableCell>
                       </TableRow>
                     ))
                   )}
                 </TableBody>
               </Table>
+
+              {filteredResultant.length > 150 && (
+                <p className="text-center text-xs text-slate-500 py-2">
+                  Showing first 150 rows of {filteredResultant.length} total resultant rows. Download Excel file for complete list.
+                </p>
+              )}
             </div>
           )}
 
@@ -720,46 +766,6 @@ export default function HomePage() {
 
           {/* VIEW: Raw File 2 */}
           {selectedView === "file2" && file2 && renderSheetTable(file2)}
-
-          {/* VIEW: Unmatched Items */}
-          {selectedView === "unmatched" && matchResults && (
-            <div className="space-y-6">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                {/* Unmatched Sheet 1 */}
-                <Card className="p-5 border-rose-900/40 bg-slate-900/90">
-                  <h3 className="text-base font-bold text-rose-400 mb-3 flex items-center gap-2">
-                    <AlertCircle className="h-4 w-4" /> Unmatched Sheet 1 ({matchResults.unmatchedSheet1.length})
-                  </h3>
-                  <div className="max-h-96 overflow-y-auto space-y-2">
-                    {matchResults.unmatchedSheet1.map((item, idx) => (
-                      <div key={idx} className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800 text-xs font-mono flex justify-between">
-                        <span className="text-white truncate">{item.client}</span>
-                        <span className="text-emerald-400 ml-2">{String(item.balance)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </Card>
-
-                {/* Unmatched Sheet 2 */}
-                <Card className="p-5 border-purple-900/40 bg-slate-900/90">
-                  <h3 className="text-base font-bold text-purple-400 mb-3 flex items-center gap-2">
-                    <AlertCircle className="h-4 w-4" /> Unmatched Sheet 2 ({matchResults.unmatchedSheet2.length})
-                  </h3>
-                  <div className="max-h-96 overflow-y-auto space-y-2">
-                    {matchResults.unmatchedSheet2.map((item, idx) => (
-                      <div key={idx} className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800 text-xs font-mono flex justify-between">
-                        <div>
-                          <span className="text-purple-300 font-bold mr-2">[{item.code}]</span>
-                          <span className="text-white">{item.name}</span>
-                        </div>
-                        <span className="text-blue-400 ml-2">{String(item.dueAmount)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </Card>
-              </div>
-            </div>
-          )}
         </div>
       )}
     </div>
