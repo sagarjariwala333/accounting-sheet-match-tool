@@ -27,6 +27,16 @@ export function extractCode(str: string): string {
   return match ? match[1].toUpperCase() : "";
 }
 
+export function cleanNameFromClientString(clientStr: string): string {
+  if (!clientStr) return "";
+  let name = clientStr.trim();
+  // Remove trailing code like -SS92239 or - SS46007 or (SS12345) and tags like OLD/NEW
+  name = name.replace(/\b(OLD|NEW)\b/gi, "").trim();
+  name = name.replace(/[-_\s:(]+\b[A-Z]{1,4}\d{3,10}\b[)]*/gi, "").trim();
+  name = name.replace(/[-_\s]+$/, "").trim();
+  return name || clientStr;
+}
+
 export async function POST(request: Request) {
   try {
     const body = await request.json();
@@ -45,12 +55,8 @@ export async function POST(request: Request) {
       h.toLowerCase().includes("balance") || h.toLowerCase().includes("amount")
     );
 
-    if (s1ClientIdx === -1) {
-      // Auto-detect client string column in Sheet 1
-      s1ClientIdx = 0;
-    }
+    if (s1ClientIdx === -1) s1ClientIdx = 0;
     if (s1BalanceIdx === -1) {
-      // Auto-detect numeric balance column in Sheet 1
       s1BalanceIdx = sheet1Rows[0]?.length > 1 ? 1 : 0;
       sheet1Rows.slice(0, 10).forEach((row: any[]) => {
         row.forEach((val: any, idx: number) => {
@@ -71,7 +77,6 @@ export async function POST(request: Request) {
       h.toLowerCase().includes("due") || h.toLowerCase().includes("amount") || h.toLowerCase().includes("balance")
     );
 
-    // Smart data-driven fallback if headers didn't explicitly match keywords
     const sampleRows2 = sheet2Rows.slice(0, 15);
     const colTypes: Array<{ isCode: number; isNumeric: number; isStatus: number; isName: number }> = [];
 
@@ -88,12 +93,11 @@ export async function POST(request: Request) {
 
         if (val.match(/^[A-Z]{1,4}\d{3,10}$/i)) {
           codeScore += 3;
-        }
-        if (!isNaN(Number(val.replace(/,/g, "")))) {
+        } else if (!isNaN(Number(val.replace(/,/g, "")))) {
           numericScore += 2;
         } else if (val.match(/^(active|inactive|pending|valid|invalid)$/i)) {
           statusScore += 3;
-        } else if (val.length > 3) {
+        } else if (val.length > 2 && !val.match(/^[A-Z]{1,4}\d{3,10}$/i)) {
           nameScore += 2;
         }
       });
@@ -131,7 +135,10 @@ export async function POST(request: Request) {
           s2NameIdx = idx;
         }
       });
-      if (s2NameIdx === -1) s2NameIdx = s2CodeIdx === 0 ? 1 : 0;
+      if (s2NameIdx === -1 || s2NameIdx === s2CodeIdx) {
+        // Fallback: if Sheet 2 has no separate name column, use column 1 or 0
+        s2NameIdx = s2CodeIdx === 0 && maxCols2 > 1 ? 1 : 0;
+      }
     }
 
     if (s2StatusIdx === -1) {
@@ -142,7 +149,6 @@ export async function POST(request: Request) {
           s2StatusIdx = idx;
         }
       });
-      // If no column is dedicated to status, set to -1 (will default to "active")
     }
 
     const matchedRecords: MatchedRecord[] = [];
@@ -170,7 +176,7 @@ export async function POST(request: Request) {
 
         if (!s2RawName && !s2RawCode) return;
 
-        // Rule A: Exact Code Match (Highest Confidence)
+        // Rule A: Exact Code Match
         if (s1Code && s2Code && s1Code === s2Code) {
           bestScore = 100;
           bestMatchIdx2 = idx2;
@@ -195,7 +201,7 @@ export async function POST(request: Request) {
           }
         }
 
-        // Rule C: Word Token Overlap Match
+        // Rule C: Token Overlap
         if (bestScore < 80 && s2NormName && s1Norm) {
           const s1Tokens = s1Norm.split(" ").filter((t) => t.length > 2);
           const s2Tokens = s2NormName.split(" ").filter((t) => t.length > 2);
@@ -218,23 +224,25 @@ export async function POST(request: Request) {
         matchedS2Indices.add(bestMatchIdx2);
 
         let rawStatus = s2StatusIdx !== -1 && row2[s2StatusIdx] !== undefined ? String(row2[s2StatusIdx]).trim() : "active";
-        // If rawStatus is numeric or equals the due amount, sanitize it to "active"
         if (!isNaN(Number(rawStatus)) || rawStatus === String(row2[s2DueIdx])) {
           rawStatus = "active";
         }
 
+        let rawCode = row2[s2CodeIdx] !== undefined ? String(row2[s2CodeIdx]).trim() : "";
+        if (!rawCode) rawCode = s1Code;
+
         let custName = row2[s2NameIdx] !== undefined ? String(row2[s2NameIdx]).trim() : "";
-        // If customer name is empty or identical to code, extract clean name from Sheet 1 client string!
-        if (!custName || custName === row2[s2CodeIdx]) {
-          const cleanedNameFromS1 = s1RawClient.replace(/[-_\s]+[A-Z0-9]{3,12}.*$/i, "").trim();
-          custName = cleanedNameFromS1 || s1RawClient;
+        
+        // If customer name is empty, identical to code, or is a code pattern (like SS92239), extract clean name from Sheet 1!
+        if (!custName || custName === rawCode || custName.match(/^[A-Z]{1,4}\d{3,10}$/i)) {
+          custName = cleanNameFromClientString(s1RawClient);
         }
 
         matchedRecords.push({
           id: `match-${idx1}-${bestMatchIdx2}`,
           sheet1Client: s1RawClient,
           sheet1Balance: s1Balance,
-          sheet2Code: row2[s2CodeIdx] !== undefined ? String(row2[s2CodeIdx]).trim() : "",
+          sheet2Code: rawCode,
           sheet2Name: custName,
           sheet2Status: rawStatus,
           sheet2DueAmount: row2[s2DueIdx] !== undefined ? row2[s2DueIdx] : 0,
